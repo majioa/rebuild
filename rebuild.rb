@@ -4,28 +4,90 @@ require 'pry'
 require 'yaml'
 require 'net/http'
 require 'json'
+require 'optparse'
 
-in_branch = 'sisyphus'
-to_branch = 'p10'
+   DEFAULT_OPTIONS = {
+      plant_dir: File.join(Dir.home, 'plant'),
+      task_no: nil,
+      clean_plant: false,
+      list_file: File.join(Dir.home, "list1"),
+      to_branch: 'sisyphus',
+      in_branch: 'sisyphus',
+      host: "git.altlinux.org",
+      hasher_root: '/tmp/.private/' + ENV['USER'],
+   }
 
-plant = File.join(Dir.home, 'plant')
+   def option_parser
+      @option_parser ||=
+         OptionParser.new do |opts|
+            opts.banner = "Usage: setup.rb [options & actions]"
+
+            opts.on("-p", "--plant-dir=FOLDER", String, "Plant folder to proceed the sources") do |folder|
+               options[:plant_dir] = folder
+            end
+
+            opts.on("-t", "--task-no=NUMBER", Integer, "Task number to prebuild the sources") do |no|
+               options[:task_no] = no
+            end
+
+            opts.on("-l", "--list-file=FILE", String, "List file to rebuild") do |file|
+               options[:list_file] = file
+            end
+
+            opts.on("-i", "--in-branch=NAME", String, "Original branch name for rebuild") do |name|
+               options[:in_branch] = name
+            end
+
+            opts.on("-o", "--to-branch=NAME", String, "Target branch name for rebuild") do |name|
+               options[:to_branch] = name
+            end
+
+            opts.on("-c", "--[no]-clean-plant", [TrueClass, FalseClass], "Clean the plant before rebuild") do |bool|
+               options[:clean_plant] = bool
+            end
+
+            opts.on("-h", "--help", "This help") do |v|
+               puts opts
+               exit
+            end
+         end
+
+      #if @argv
+      #   @option_parser.default_argv.replace(@argv)
+      #elsif @option_parser.default_argv.empty?
+      #   @option_parser.default_argv << "-h"
+      #end
+
+      @option_parser
+   end
+
+   def options
+      @options ||= DEFAULT_OPTIONS.dup
+   end
+
+option_parser.parse!
+
+pp options
+
+in_branch = options[:in_branch]
+to_branch = options[:to_branch]
+plant = options[:plant_dir]
 log_dir = File.join(plant, 'logs')
 srpm_dir = File.join(plant, 'srpms')
 rpm_dir = File.join(plant, 'rpms')
-hasher_root = '/tmp/.private/user'
-hasher_dirs = ['/tmp/.private/user/repo/x86_64/RPMS.hasher/']
-#rpmfolder = `find /tmp/.private/majioa/repo/ -name RPMS.hasher -type d`
-task_no = ARGV[1]
-list_file = File.join(Dir.home, "list1")
-host = "git://git.altlinux.org/"
+hasher_root = options[:hasher_root]
+hasher_dirs = Dir["#{options[:hasher_root]}/repo/**/RPMS.hasher"]
+task_no = options[:task_no]
+list_file = options[:list_file]
+host = options[:host]
+git_host = "git://#{host}/"
 
 # cleanup optional
-if ARGV.include?("-c")
+if options[:clean_plant]
    FileUtils.rm_rf(log_dir)
    FileUtils.rm_rf(srpm_dir)
    FileUtils.rm_rf(rpm_dir)
-   #FileUtils.rm_rf(hasher_dirs)
-   #/tmp/.private/majioa/repo/i586/RPMS.hasher/
+   FileUtils.rm_rf(hasher_dirs)
 end
 
 FileUtils.mkdir_p(log_dir)
@@ -36,14 +98,14 @@ FileUtils.mkdir_p(rpm_dir)
 package_hash = {}
 if task_no
     # paths.map {|x| [x.match(/(?<name>[^\/]+).git$/)[:name], x] }.to_h
-     json = Net::HTTP.get("git.altlinux.org", "/tasks/#{task_no}/info.json")
+     json = Net::HTTP.get(host, "/tasks/#{task_no}/info.json")
      data = JSON.parse(json)
    package_hash =
      data["subtasks"].map do |(no, d)|
       next nil if !d["dir"]
       name = d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
 
-      [ name, "git://git.altlinux.org/tasks/#{task_no}/gears/#{no}/git"]
+      [ name, File.join(git_host, "tasks", task_no, "gears", no, "git")]
      end.compact.to_h
 end
 
@@ -64,14 +126,14 @@ list_hash.each do |name, path|
   FileUtils.mkdir_p(File.join(plant, "poligon"))
 
   FileUtils.cd(File.join(plant, "poligon"))
-  fullpath = path =~ /^git:\/\// && path || File.join(host, path)
+  fullpath = path =~ /^git:\/\// && path || File.join(git_host, path)
   puts "git clone #{fullpath} #{name}"
   `git clone #{fullpath} #{name}`
 
   next if !File.directory?(name)
   FileUtils.cd(name)
   branches = `cat .git/packed-refs |grep remotes/origin`.split("\n").map {|x|x.match(/\/(?<b>[^\/]+)$/)[:b]}
-  selected_branch = (branches & [to_branch, 'master']).first
+  selected_branch = ([to_branch, 'master', in_branch] & branches).first
   if !selected_branch
     puts "No branch selected"
     next
