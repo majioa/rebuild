@@ -42,7 +42,7 @@ require 'optparse'
                options[:to_branch] = name
             end
 
-            opts.on("-c", "--[no]-clean-plant", [TrueClass, FalseClass], "Clean the plant before rebuild") do |bool|
+            opts.on("-c", "--[no-]clean-plant", "Clean the plant before rebuild") do |bool|
                options[:clean_plant] = bool
             end
 
@@ -105,7 +105,7 @@ if task_no
       next nil if !d["dir"]
       name = d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
 
-      [ name, File.join(git_host, "tasks", task_no, "gears", no, "git")]
+      [ name, File.join(git_host, "tasks", task_no.to_s, "gears", no.to_s, "git")]
      end.compact.to_h
 end
 
