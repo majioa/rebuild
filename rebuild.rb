@@ -4,6 +4,7 @@ require 'pry'
 require 'yaml'
 require 'net/http'
 require 'json'
+require 'time'
 require 'optparse'
 
 DEFAULT_OPTIONS = {
@@ -103,27 +104,39 @@ FileUtils.mkdir_p(rpm_dir)
 #
 package_hash = {}
 if task_no
-    # paths.map {|x| [x.match(/(?<name>[^\/]+).git$/)[:name], x] }.to_h
-     json = Net::HTTP.get(host, "/tasks/#{task_no}/info.json")
-     data = JSON.parse(json)
-   package_hash =
-     data["subtasks"].map do |(no, d)|
-      next nil if !d["dir"]
-      name = d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
+   json = Net::HTTP.get(host, "/tasks/#{task_no}/info.json")
+   data = JSON.parse(json)
 
-      [ name, File.join(git_host, "tasks", task_no.to_s, "gears", no.to_s, "git")]
-     end.compact.to_h
+   package_hash =
+      data["subtasks"].map do |(no, d)|
+         next nil if !d["dir"]
+         name = d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
+
+         data = {
+            'path' => File.join(git_host, "tasks", task_no.to_s, "gears", no.to_s, "git"),
+            'tag_name' => d['tag_name'],
+            'tag_id' => d['tag_id'],
+            'fetched_at' => Time.parse(d["fetched"])
+         }
+
+         [ name, data ]
+      end.compact.to_h
 end
 
-list_hash = package_hash.merge((IO.read(list_file).split("\n") - package_hash.keys).map {|name| [name, "/gears/#{name[0]}/#{name}.git"] }.to_h)
+list_hash =
+   package_hash.merge((IO.read(list_file).split("\n") - package_hash.keys).map do |name|
+      [name, { 'path' => "/gears/#{name[0]}/#{name}.git" }]
+   end.to_h)
 statuses = {}
 status = nil
 
-list_hash.each do |name, path|
+list_hash.each do |name, data|
    puts name
    begin
       statuses[name] = YAML.load(IO.read(File.join(log_dir, "#{name}.yml")))
-      next if statuses[name]["status"] == 0
+      next if statuses[name]["status"] == 0 &&
+         statuses[name]['tag_id'] == data['tag_id'] &&
+         statuses[name]['fetched_at'] == data['fetched_at']
    rescue
    ensure
       status = {}
@@ -131,8 +144,9 @@ list_hash.each do |name, path|
 
    FileUtils.rm_rf(File.join(plant, "poligon"))
    FileUtils.mkdir_p(File.join(plant, "poligon"))
-
    FileUtils.cd(File.join(plant, "poligon"))
+
+   path = data['path']
    fullpath = path =~ /^git:\/\// && path || File.join(git_host, path)
    puts "git clone #{fullpath} #{name}"
    `git clone #{fullpath} #{name}`
@@ -181,6 +195,8 @@ list_hash.each do |name, path|
    status["srpms"] = srpms
    status["rpms"] = rpms
    status["name"] = name
+   status = status.merge(data)
+
    File.open(File.join(log_dir, "#{name}.yml"), "w+") {|f| f.puts(status.to_yaml) }
    statuses[name] = status
    $stdout.puts "Status: #{status["status"]}"
