@@ -209,7 +209,7 @@ oks = statuses.values.sum  {|x| x["status"] == 0 && 1 || 0 }
 errors = statuses.values.size - oks
 puts "Compilation summary: ok: #{oks}, errored #{errors}"
 
-if !status || !break_on_error || status["status"] == 0
+if !status || !break_on_error || status.empty? || status["status"] == 0
    rpms = statuses.values.map {|v| v["rpms"] }.flatten.reject {|x| x =~ /debuginfo/ }
    log=`hsh-install #{rpms.join(" ")}`
    puts "Installation status #{$?}:\n#{log}"
