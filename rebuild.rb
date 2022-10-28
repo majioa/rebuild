@@ -52,6 +52,14 @@ def option_parser
             options[:break_on_error] = bool
          end
 
+         opts.on("-a", "--[no-]assign", "Assign all successive packages to the specified task to build") do |bool|
+            options[:assign] = bool
+         end
+
+         opts.on("-A", "--[no-]auto-assign", "When building will auto assign all successly built packages to the specified task to build") do |bool|
+            options[:auto_assign] = bool
+         end
+
          opts.on("-h", "--help", "This help") do |v|
             puts opts
             exit
@@ -88,18 +96,10 @@ list_file = options[:list_file]
 break_on_error = options[:break_on_error]
 host = options[:host]
 git_host = "git://#{host}/"
+assign = options[:assign]
+auto_assign = options[:auto_assign]
+func = in_branch != to_branch && 'copy' || 'rebuild'
 
-# cleanup optional
-if options[:clean_plant]
-   FileUtils.rm_rf(log_dir)
-   FileUtils.rm_rf(srpm_dir)
-   FileUtils.rm_rf(rpm_dir)
-   FileUtils.rm_rf(hasher_dirs)
-end
-
-FileUtils.mkdir_p(log_dir)
-FileUtils.mkdir_p(srpm_dir)
-FileUtils.mkdir_p(rpm_dir)
 # переименован 'chroot/.out/gem-method-source-1.0.0-alt1.src.rpm' -> 'repo/SRPMS.hasher/gem-method-source-1.0.0-alt1.src.rpm'
 #
 package_hash = {}
@@ -130,13 +130,56 @@ list_hash =
 statuses = {}
 status = nil
 
+def assign_to_task task_no, func, name
+   puts "Assigning #{name} to task #{task_no}"
+
+   puts "ssh git_majioa@gyle.altlinux.org -p 222 task add #{task_no} #{func} #{name}"
+   `ssh git_majioa@gyle.altlinux.org -p 222 task add #{task_no} #{func} #{name}`
+end
+
+if assign && task_no
+   list_hash.each do |name, path|
+      puts "Analyzing #{name}"
+      begin
+         statuses[name] = YAML.load(IO.read(File.join(log_dir, "#{name}.yml")))
+         next if statuses[name]["status"] != 0
+      rescue
+         next
+      ensure
+      end
+
+      next if package_hash.keys.include?(name)
+
+      assign_to_task(task_no, func, name)
+   end
+
+   exit
+end
+
+# cleanup optional
+if options[:clean_plant]
+   FileUtils.rm_rf(log_dir)
+   FileUtils.rm_rf(srpm_dir)
+   FileUtils.rm_rf(rpm_dir)
+   FileUtils.rm_rf(hasher_dirs)
+end
+
+FileUtils.mkdir_p(log_dir)
+FileUtils.mkdir_p(srpm_dir)
+FileUtils.mkdir_p(rpm_dir)
 list_hash.each do |name, data|
    puts name
    begin
       statuses[name] = YAML.load(IO.read(File.join(log_dir, "#{name}.yml")))
-      next if statuses[name]["status"] == 0 &&
+      if statuses[name]["status"] == 0 &&
          statuses[name]['tag_id'] == data['tag_id'] &&
          statuses[name]['fetched_at'] == data['fetched_at']
+         if task_no && auto_assign && !package_hash.keys.include?(name)
+            assign_to_task(task_no, func, name)
+         end
+
+         next
+      end
    rescue
    ensure
       status = {}
@@ -200,7 +243,12 @@ list_hash.each do |name, data|
    File.open(File.join(log_dir, "#{name}.yml"), "w+") {|f| f.puts(status.to_yaml) }
    statuses[name] = status
    $stdout.puts "Status: #{status["status"]}"
+
    break if break_on_error && status["status"] != 0
+
+   if task_no && auto_assign && status["status"] == 0 && !package_hash.keys.include?(name)
+      assign_to_task(task_no, func, name)
+   end
 end
 
 File.open(File.join(log_dir, "-common.yml"), "w+") {|f| f.puts(statuses.to_yaml) }
