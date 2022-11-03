@@ -141,9 +141,9 @@ if assign && task_no
    list_hash.each do |name, path|
       puts "Analyzing #{name}"
       begin
-         statuses[name] = YAML.load(IO.read(File.join(log_dir, "#{name}.yml")))
+         statuses[name] = YAML.load(IO.read(File.join(log_dir, "#{name}.yml")), permitted_classes: [Time])
          next if statuses[name]["status"] != 0
-      rescue
+      rescue Errno::ENOENT
          next
       ensure
       end
@@ -158,6 +158,7 @@ end
 
 # cleanup optional
 if options[:clean_plant]
+   `hsh --initroot -vvvv > #{File.join(log_dir, 'initroot.log')} 2>&1`
    FileUtils.rm_rf(log_dir)
    FileUtils.rm_rf(srpm_dir)
    FileUtils.rm_rf(rpm_dir)
@@ -170,7 +171,7 @@ FileUtils.mkdir_p(rpm_dir)
 list_hash.each do |name, data|
    puts name
    begin
-      statuses[name] = YAML.load(IO.read(File.join(log_dir, "#{name}.yml")))
+      statuses[name] = YAML.load(IO.read(File.join(log_dir, "#{name}.yml")), permitted_classes: [Time])
       if statuses[name]["status"] == 0 &&
          statuses[name]['tag_id'] == data['tag_id'] &&
          statuses[name]['fetched_at'] == data['fetched_at']
@@ -180,7 +181,7 @@ list_hash.each do |name, data|
 
          next
       end
-   rescue
+   rescue Errno::ENOENT
    ensure
       status = {}
    end
