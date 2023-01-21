@@ -16,6 +16,7 @@ DEFAULT_OPTIONS = {
    clean_plant: false,
    break_on_error: false,
    drop_nonbuilt: false,
+   verbose: false,
    list_file: File.join(Dir.home, "list1"),
    to_branch: 'sisyphus',
    in_branch: 'sisyphus',
@@ -69,17 +70,15 @@ def option_parser
             options[:drop_nonbuilt] = bool
          end
 
+         opts.on("-v", "--[no-]verbose", "Enable verbose output") do |bool|
+            options[:verbose] = bool
+         end
+
          opts.on("-h", "--help", "This help") do |v|
             puts opts
             exit
          end
       end
-
-   #if @argv
-   #   @option_parser.default_argv.replace(@argv)
-   #elsif @option_parser.default_argv.empty?
-   #   @option_parser.default_argv << "-h"
-   #end
 
    @option_parser
 end
@@ -92,31 +91,30 @@ option_parser.parse!
 
 pp options
 
-# in_branch = options[:in_branch]
-# to_branch = options[:to_branch]
-# task_no = options[:task_no]
-# list_file = options[:list_file]
-# break_on_error = options[:break_on_error]
-# host = options[:host]
-# assign = options[:assign]
-# auto_assign = options[:auto_assign]
-
 module Shell
-   def sh *args, mode: 'r+', logfile: nil
+   def sh *args, mode: 'r+', logfile: nil, logmode: 'w+'
+      $stdout.puts(args.join(' ')) if plant.verbose
       log = IO.popen({'REBUILD' => '1'}, args.map(&:to_s), mode, err: %i(child out)) do |pipe|
          pipe.close_write
 
          log = []
          while line = pipe.gets
             log.append(line.strip)
+            $stdout.puts line if plant.verbose
          end
 
          log
       end
-
-      File.open(logfile, "w+") { |f| f.puts(log.join("\n")) } if logfile
-
-      log
+   rescue Errno::E2BIG
+      log =
+         begin
+            `#{args.join(' ')} 2>&1`.split("\n")
+         rescue
+            []
+         end
+   ensure
+      #binding.pry #if logfile.to_s =~ /install/
+     File.open(logfile, logmode) { |f| f.puts(log.join("\n")) } if logfile && !log.nil? && !log.empty?
    end
 end
 
@@ -124,6 +122,10 @@ class Plant
    include Shell
 
    attr_reader :options
+
+   def plant
+      self
+   end
 
    def root
       @root ||= options.plant_dir
@@ -183,7 +185,7 @@ class Plant
    end
 
    def cleanup
-      `hsh --initroot -vvvv > #{File.join(log_dir, 'initroot.log')} 2>&1`
+      sh('hsh', '--initroot', '-vvvv', logfile: File.join(log_dir, 'initroot.log'))
       %w(hasher_dirs log_dir srpm_dir rpm_dir status_dir).flatten.each do |x|
          FileUtils.rm_rf(send(x))
          instance_variable_set("@#{x}", nil)
@@ -215,7 +217,7 @@ class Plant
    def method_missing method, *args
       value = options[method]
 
-      value && instance_variable_set("@#{method}", value) || super
+      value.nil? ? super : instance_variable_set("@#{method}", value)
    end
 end
 
@@ -233,7 +235,7 @@ class Build
    end
 
    def is_require_reassiging? gear, flow
-     task_no && plant.options.auto_assign && flow.map { |x| x['name']}.include?(gear.name) && gear.lost_deps.any?
+     task_no && plant.options.auto_assign && flow.map { |x| x['name']}.include?(gear.name) && gear.lost_deps&.any?
    end
 
    def is_matched? gear
@@ -260,18 +262,32 @@ class Build
       errors << [kind, message, args]
    end
 
+   def check_assign_to_task gear, name, flow
+      res = true
+
+      if req_no = detect_subtask_self_or_before(gear.no, flow)
+         res = yield if block_given?
+
+         aa=assign_to_task(task_no, name, subtask_no: req_no) if res
+#         binding.pry
+         aa
+      else
+         error(:assign, 'No free space before #{gear.name} with no #{gear.no}', gear)
+      end
+   end
+
    def autoassign gear, flow
       if gear.states.include?(:removed)
          /(ruby-)?(?<name_tmp>.*)/ =~ gear.name
          new_name = packetize_name(name_tmp)
          if plant.in_branch_match_package?(new_name)
-            assign_to_task(task_no, new_name)
+            check_assign_to_task(gear, new_name, flow)
          end
 
          remove_in_task(task_no, gear.name)
          flow.shift
       elsif gear.states.include?(:built)
-         assign_to_task(task_no, gear.name)
+         check_assign_to_task(gear, gear.name, flow)
          flow.shift
       end
    end
@@ -280,6 +296,7 @@ class Build
       if gear.error_type == :lost_deps
          gear.lost_deps.each do |dep|
             if new_element = preassign_dep_to_task(dep, gear, flow)
+#         binding.pry
                flow.unshift(new_element)
             else
                error(:assign, 'Required gem #{o.name} is unavailable', o: dep)
@@ -296,32 +313,24 @@ class Build
       packetized_name = packetize_name(dep.name)
 
       if plant.in_branch_match_package?(packetized_name)
-#        binding.pry if !gear.no
-         if req_no = detect_subtask_self_or_before(gear.no, flow)
+         check_assign_to_task(gear, packetized_name, flow) do
             has = package_hash[packetized_name]
 
             if has && has['no'] > gear.no
-#           binding.pry
                delete_subtask(has['no'])
             end
 
-            if !has || has['no'] > gear.no
-               assign_to_task(task_no, packetized_name, subtask_no: req_no)
-            end
-#            yield(gear) if block_given?
-         else
-           binding.pry
-            error(:assign, 'No free space before #{gear.name} with no #{gear.no}', gear)
+            !has || has['no'] > gear.no
          end
       end
    end
 
    def detect_subtask_self_or_before no_in, flow
       if no_in > 1
-         noes = (no_hash.keys | flow.map { |x| x['no']}.compact).sort
+         noes_tmp = (noes | flow.map { |x| x['no']}.compact).sort
          no = no_in
 
-         while no > 1 && noes.find {|x| no - 1 == x }
+         while no > 1 && noes_tmp.find {|x| no - 1 == x }
             no -= 1
          end
 
@@ -334,10 +343,6 @@ class Build
    end
 
    def assign_to_task task_no, name, subtask_no: nil
-      #puts "Assigning #{name} to task #{task_no}"
-   
-      # puts "ssh git_majioa@gyle.altlinux.org -p 222 task add #{task_no} #{func} #{name}"
-      #`ssh git_majioa@gyle.altlinux.org -p 222 task add #{task_no} #{func} #{name}`
       args = ['ssh', 'git_majioa@gyle.altlinux.org', '-p', '222', 'task', 'add', task_no, subtask_no&.to_s(8), func, name]
 
       l = sh(*args.compact)
@@ -350,9 +355,9 @@ class Build
          'no' => subtask_no8.to_i(8),
          'fetched_at' => Time.now
       }
-   rescue Exception
-     binding.pry
-    end
+   rescue
+      $stdout.puts(l) if plant.verbose
+   end
 
    def task_data
       return @task_data if @task_data
@@ -390,7 +395,7 @@ class Build
          targets.map do |(no, d)|
             next nil if !d["dir"]
             name = d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
-   
+
             data = {
                'name' => name,
                'path' => File.join(plant.git_host, "tasks", task_no.to_s, "gears", no.to_s, "git"),
@@ -401,9 +406,13 @@ class Build
                'rebuild_from' => d["rebuild_from"],
                'fetched_at' => Time.parse(d["fetched"])
             }
-   
+
             [ name, data ]
          end.compact.to_h
+   end
+
+   def noes
+      @noes ||= targets.keys.map {|x|x.to_i(8) }.sort
    end
 
    def delete_subtask no
@@ -411,13 +420,12 @@ class Build
       list_hash.delete_if { |_, v| v['no'] == no }
    end
 
-
    def rebuild
       plant.cleanup if plant.options.clean_plant
 
       File.open(File.join(plant.root, "common.yml"), "w+") {|f| f.puts(statuses.to_yaml) }
-      oks = gears.values.sum  {|x| x.status == 0 && 1 || 0 }
-      errors = gears.values.size - oks
+      oks = gears.values.sum  {|x| is_matched?(x) && 1 || 0 }
+      @errors = gears.values.size - oks
 
       puts "Compilation summary: ok: #{oks}, errored #{errors}"
 
@@ -425,11 +433,9 @@ class Build
    end
 
    def install
-     if !plant.break_on_error || gears.empty? || gears.values.last.status == 0
-        rpms = gears.values.map {|v| v.rpms }.flatten.reject {|x| x =~ /debuginfo/ }
-#      binding.pry
-         `hsh-install #{rpms.join(" ")} > #{File.join(plant.log_dir, 'install.log')}`
-         puts "Installation status #{$?}:\n#{log}"
+      if !plant.break_on_error || gears.empty? || @errors == 0
+         rpms = gears.values.map {|v| v.rpms }.flatten.reject {|x| x =~ /debuginfo/ }
+         sh('hsh-install', rpms.join(" "), logfile: File.join(plant.log_dir, 'install.log'))
       end
    end
 
@@ -439,18 +445,6 @@ class Build
 
    def gears
       @gears ||= package_flow
-#         list_hash.reduce({}) do |res, (name, data)|
-#            print name
-#            gear = Gear.import(name: name, **data.transform_keys(&:to_sym), plant: plant)
-#            gear_proceed(gear)
-#            gear_post_proceed(gear)
-#
-#            if plant.break_on_error && !is_matched?(gear)
-#               break tmp_res
-#            else
-#               tmp_res
-#            end
-#         end.to_h
    end
 
    def package_flow
@@ -460,19 +454,14 @@ class Build
 
       while !flow.empty? && !stop
          element = flow.first
-         binding.pry if !element['name']
          gear = Gear.import(**element.transform_keys(&:to_sym), plant: plant)
          gear_proceed(gear)
          gear_post_proceed(gear, flow)
          res[gear.name] = gear
 
-         stop = plant.break_on_error && !is_matched?(gear) && !gear.lost_deps.any?
-         binding.pry if stop
-#         if gear.error_type != :lost_deps || !is_require_assiging?(gear)
-#         flow.shift
-#         else
-#           binding.pry
-#         end
+         stop = plant.break_on_error && !is_matched?(gear) && !gear.lost_deps&.any?
+         #unknown_error
+#         binding.pry if gear.error_type != :ok
       end
 
       res
@@ -481,15 +470,13 @@ class Build
    def gear_proceed gear
       print(gear.name)
       if is_removed?(gear)
-         # remove_gear(gear)
-         # TODO search for replacement if renamed 
+         # TODO search for replacement if renamed
          gear.store_status
          puts("...-")
       elsif is_built?(gear)
          puts("...V")
       else
          unless is_built_remotely?(gear) && gear.error_type == :ok
-#         binding.pry if gear.error_type != :ok
             gear.make(force: gear.error_type == :lost_deps)
          end
          gear.error_type != :ok ? puts("...X") : puts("...V")
@@ -499,7 +486,6 @@ class Build
    def gear_post_proceed gear, flow
       gear.store_status
       if is_require_assiging?(gear, flow)
-#         binding.pry
          autoassign(gear, flow)
       elsif is_require_reassiging?(gear, flow)
          autoreassign(gear, flow)
@@ -521,7 +507,7 @@ class Gear
    include Shell
 
    NAMES = %w(srpms rpms name path tag_name tag_id fetched_at states)
-   RE = /E: (Невозможно найти пакет (?:ruby-?)?gem\((?<name>[^ )]+)\)(?<cond>[>=<~!]+)(?<version>[^']*)|Версия (?<cond>[>=<~!]+)'(?<version>[^']*)' для '(?:ruby-?)?gem\((?<name>[^ ']+)\)' не найдена)/
+   RE = /E: (Невозможно найти пакет (?:ruby-?)?gem\((?<name>[^ )]+)\)(?<cond>[>=<~!]+)(?<version>[^']*)|Версия (?<cond>[>=<~!]+)'(?<version>[^']*)' для '(?:ruby-?)?gem\((?<name>[^ ']+)\)' не найдена)|: Требует: gem\((?<name>[^ )]+)\) \((?<cond>[>=<~!]+)(?<version>[^']*)\)/
 
    attr_reader :plant, :states, :status, :name, :path, :srpms, :rpms, :tag_name, :tag_id, :fetched_at, :pkgname, :no, :rebuild_from
 
@@ -542,25 +528,22 @@ class Gear
 
    def is_checked_out?
       Dir.chdir(File.join(plant.poligon_dir, name)) do
-         !sh('git', 'branch', '--list', 'build').nil?
+         !sh('git', 'branch', '--list', 'build').empty?
       end
    rescue Errno::ENOENT
       false
    end
 
    def is_built?
-#      @states = [:built] if status_in['tag_id'] == args[:tag_id] && status == 0
-      rpms.any? && (!@storen_status['tag_id'] || @storen_status['tag_id'] == tag_id) && status == 0
+      rpms.any? && status == 0 &&
+         (!@storen_status['tag_id'] ||
+           @storen_status['tag_id'] == tag_id) &&
+         (!@storen_status['tag_name'] ||
+           @storen_status['tag_name'] == tag_name )
    end
 
    def is_removed?
       !plant.in_branch_match_package?(name)
-      #a=!Net::HTTP.get(plant.host, "/gears/#{name[0]}/#{name}.git")
-#      a=sh('ssh', 'gitery.altlinux.org', '-p', '222', '-l', 'git_majioa', 'find-package', name)
-      #binding.pry if a
-      #a
-   #rescue
-   #   true
    end
 
    def logfile
@@ -580,8 +563,6 @@ class Gear
    def log
       @log ||= IO.read(logfile).encode("UTF-16be", invalid: :replace, replace: "?").encode('UTF-8')
    rescue Errno::ENOENT
-   rescue Exception
-     binding.pry
    end
 
    def error_types
@@ -592,7 +573,6 @@ class Gear
       error_types[log] ||=
          case log
          when /E: Some index files failed to download. /
-            #"E: Some index files failed to download. They have been ignored, or old ones used instead."
             :lost_indeces
          when /fatal: remote error: access denied or repository not exported/
             :not_exist
@@ -601,7 +581,7 @@ class Gear
          when nil
             :unbuilt
          else
-            states.include?(:built) && :ok || :unbuilt
+           states.include?(:built) && :ok || status.to_i > 0 && :unknown_error || :unbuilt
          end
    end
 
@@ -635,7 +615,7 @@ class Gear
          if File.directory?(name)
             FileUtils.cd(name)
             preclean if force
-            checkout(selected_branch) if force || states.include?(:cloned)
+            checkout(selected_tag) if force || states.include?(:cloned)
             build if force || states.include?(:checked_out)
          end
       end
@@ -643,20 +623,18 @@ class Gear
 
    def clone
       print "...cloning"
-      # puts "git clone #{fullpath} #{name}"
-      `git clone #{fullpath} #{name} >> #{logfile} 2>&1`
+      sh('git', 'clone', fullpath, name, logfile: logfile, logmode: 'a+')
 
       state = error_type == :not_exist && :removed || :cloned
 
       @states |= [state]
    end
 
-   def checkout branch
+   def checkout tag
       logfile = File.join(plant.log_dir, "#{name}.log")
 
-      # puts "git checkout refs/remotes/origin/#{branch} -b build"
-      sh('git', 'checkout', "refs/remotes/origin/#{branch}", '-b build', logfile: logfile)
-      #`git checkout refs/remotes/origin/#{branch} -b build > #{logfile} 2>&1`
+      #sh('git', 'checkout', "refs/remotes/origin/#{branch}", '-b build', logfile: logfile)
+      sh('git', 'checkout', tag, '-b', 'build', logfile: logfile)
 
       @states |= [:checked_out]
    end
@@ -664,10 +642,10 @@ class Gear
    def build
       print "...building"
       while %i(unbuilt lost_indeces).include?(error_type)
+#         binding.pry
          preclean
-         `gear-hsh --commit -- -vvvv > #{logfile} 2>&1`
+         sh('gear-hsh', '--commit', '--', '-vvvv', logfile: logfile)
          @states |= [:built] if (@status = $?.exitstatus) == 0
-#            binding.pry 
       end
    end
 
@@ -709,15 +687,19 @@ class Gear
    end
 
    def branches
-      @branches ||= `cat .git/packed-refs |grep remotes/origin`.split("\n").map {|x|x.match(/\/(?<b>[^\/]+)$/)[:b]}
-#      if !selected_branch
-#         puts "No branch selected"
-#         next
-#      end
+      @branches ||=
+        sh('cat', '.git/packed-refs').select {|x| x =~ %r{remotes/origin} }.map {|x|x.match(%r{/(?<b>[^/]+)$})[:b]}
    end
 
-   def selected_branch
-      @selected_branch ||= rebuild_from || ([plant.to_branch, 'master', plant.in_branch] & branches).first
+   def selected_tag
+      @selected_tag ||= tag_name || tag_from_branch
+   end
+
+   def tag_from_branch
+#     binding.pry
+      branch = rebuild_from || ([plant.to_branch, 'master', plant.in_branch] & branches).first
+
+      sh('git', 'describe', '--tags', '--abbrev=0', "origin/#{branch}")
    end
 
    def name
@@ -765,8 +747,6 @@ class Gear
          instance_variable_set("@#{name}", value)
       end
 
-      binding.pry if !self.no
-
       touch_status if has_log?
    end
 
@@ -782,34 +762,11 @@ class Gear
       #def import name: raise, path: nil, tag_name: nil, tag_id: nil, fetched_at: nil, plant: raise
       def import name: raise, plant: raise, **args
          status = load_status(name, plant)
-#           binding.pry if name =~ /gem-airbrussh/
 
          self.new(status, name: name, plant: plant, **args)
       end
    end
 end
-
-
-#if assign && task_no
-#   list_hash.each do |name, path|
-#      puts "Analyzing #{name}"
-#      begin
-#         gears[name] = Gear.import(name, plant)
-#         next if gears[name]["status"] != 0
-#      rescue Errno::ENOENT
-#         next
-#      ensure
-#      end
-#
-#      next if package_hash.keys.include?(name)
-#
-#      assign_to_task(task_no, func, name)
-#   end
-#
-#   exit
-#end
-#
-
 
 plant = Plant.new(options)
 Build.new(plant).rebuild
