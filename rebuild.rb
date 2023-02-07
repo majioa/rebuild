@@ -17,6 +17,8 @@ DEFAULT_OPTIONS = {
    break_on_error: false,
    drop_nonbuilt: false,
    verbose: false,
+   auto_assign: false,
+   assign: false,
    list_file: File.join(Dir.home, "list1"),
    to_branch: 'sisyphus',
    in_branch: 'sisyphus',
@@ -239,15 +241,15 @@ class Build
    end
 
    def is_matched? gear
-      (gear.states & [:built, :removed]).any?
+      (gear.states & [:built, :to_delete]).any?
    end
 
    def is_built? gear
       gear.states.include?(:built)
    end
 
-   def is_removed? gear
-      gear.states.include?(:removed)
+   def is_to_delete? gear
+      gear.states.include?(:to_delete)
    end
 
    def is_built_remotely? gear
@@ -277,7 +279,7 @@ class Build
    end
 
    def autoassign gear, flow
-      if gear.states.include?(:removed)
+      if gear.states.include?(:to_delete)
          /(ruby-)?(?<name_tmp>.*)/ =~ gear.name
          new_name = packetize_name(name_tmp)
          if plant.in_branch_match_package?(new_name)
@@ -393,8 +395,16 @@ class Build
    def package_hash
       @package_hash ||=
          targets.map do |(no, d)|
-            next nil if !d["dir"]
-            name = d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
+           #binding.pry if d["type"] == 'delete'
+            #next nil if !d["dir"] || d["type"] == 'delete'
+            name =
+               if d["type"] == 'delete'
+                  d['package']
+               elsif d["dir"]
+                  d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
+               end
+
+            next nil unless name
 
             data = {
                'name' => name,
@@ -402,9 +412,9 @@ class Build
                'tag_name' => d['tag_name'],
                'tag_id' => d['tag_id'],
                'no' => no.to_i(8),
-               'pkgname' => d["pkgname"],
+               'pkgname' => d["pkgname"] || d['package'],
                'rebuild_from' => d["rebuild_from"],
-               'fetched_at' => Time.parse(d["fetched"])
+               'fetched_at' => d["fetched"] && Time.parse(d["fetched"])
             }
 
             [ name, data ]
@@ -459,9 +469,9 @@ class Build
          gear_post_proceed(gear, flow)
          res[gear.name] = gear
 
-         stop = plant.break_on_error && !is_matched?(gear) && !gear.lost_deps&.any?
+         stop = plant.break_on_error && !is_matched?(gear) && !is_require_reassiging?(gear, flow)
          #unknown_error
-#         binding.pry if gear.error_type != :ok
+         #binding.pry if gear.error_type != :ok && !stop
       end
 
       res
@@ -469,8 +479,9 @@ class Build
 
    def gear_proceed gear
       print(gear.name)
-      if is_removed?(gear)
-         # TODO search for replacement if renamed
+      # TODO search for replacement if renamed
+      # + removed with delsub
+      if is_to_delete?(gear) # assign to delete from repo
          gear.store_status
          puts("...-")
       elsif is_built?(gear)
@@ -517,7 +528,7 @@ class Gear
 
    def states
       @states ||=
-         %i(removed cloned checked_out built).select do |state|
+         %i(to_delete cloned checked_out built).select do |state|
             send("is_#{state}?")
          end
    end
@@ -542,8 +553,9 @@ class Gear
            @storen_status['tag_name'] == tag_name )
    end
 
-   def is_removed?
-      !plant.in_branch_match_package?(name)
+   def is_to_delete?
+      fetched_at.nil?
+      #!plant.in_branch_match_package?(name)
    end
 
    def logfile
@@ -625,7 +637,7 @@ class Gear
       print "...cloning"
       sh('git', 'clone', fullpath, name, logfile: logfile, logmode: 'a+')
 
-      state = error_type == :not_exist && :removed || :cloned
+      state = error_type == :not_exist && :to_delete || :cloned
 
       @states |= [state]
    end
