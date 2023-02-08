@@ -752,7 +752,7 @@ class Gear
 
    class << self
       def load_status name, plant
-         YAML.load(IO.read(File.join(plant.status_dir, "#{name}.yml")), permitted_classes: [Time])
+         YAML.load(IO.read(File.join(plant.status_dir, "#{name}.yml")), permitted_classes: [Time, Symbol])
       rescue ArgumentError
          YAML.load(IO.read(File.join(plant.status_dir, "#{name}.yml")))
       rescue Errno::ENOENT
