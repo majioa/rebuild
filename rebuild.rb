@@ -381,7 +381,8 @@ class Build
             name = name_tmp || name_in
             value = (package_hash[name] || {}).merge({
                'path' => "/gears/#{name[0]}/#{name}.git",
-               'name' => name
+               'name' => name,
+               'fetched_at' => Time.now
             })
 
             [name, value]
@@ -483,6 +484,7 @@ class Build
       # + removed with delsub
       if is_to_delete?(gear) # assign to delete from repo
          gear.store_status
+         # binding.pry
          puts("...-")
       elsif is_built?(gear)
          puts("...V")
