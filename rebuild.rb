@@ -198,6 +198,10 @@ class Plant
       srpm_list_for(in_branch)
    end
 
+   def in_branch_srpm_list_plain
+      @in_branch_srpm_list_plain ||= in_branch_srpm_list.join("\n")
+   end
+
    def to_branch_srpm_list
       srpm_list_for(to_branch)
    end
@@ -209,7 +213,7 @@ class Plant
    end
 
    def in_branch_match_package? name
-      in_branch_srpm_list.grep(/^#{name}-[^-]*-alt[^-]*$/).any?
+      in_branch_srpm_list_plain =~ /^#{name}-[^-]*-alt[^-]*$/
    end
 
    def initialize options
@@ -241,15 +245,21 @@ class Build
    end
 
    def is_matched? gear
-      (gear.states & [:built, :to_delete]).any?
+      (gear.states & [:built, :to_delete, :removed]).any?
    end
 
    def is_built? gear
       gear.states.include?(:built)
    end
 
+   # returns state for a gear, which was marked to delete from target branch
    def is_to_delete? gear
       gear.states.include?(:to_delete)
+   end
+
+   # returns state for a gear, which was removed from a target branch
+   def is_removed? gear
+      gear.states.include?(:removed)
    end
 
    def is_built_remotely? gear
@@ -471,6 +481,7 @@ class Build
          res[gear.name] = gear
 
          stop = plant.break_on_error && !is_matched?(gear) && !is_require_reassiging?(gear, flow)
+         #binding.pry if (gear.states & [:removed]).any?
          #unknown_error
          #binding.pry if gear.error_type != :ok && !stop
       end
@@ -485,9 +496,11 @@ class Build
       if is_to_delete?(gear) # assign to delete from repo
          gear.store_status
          # binding.pry
-         puts("...-")
+         puts("...\\")
       elsif is_built?(gear)
          puts("...V")
+      elsif is_removed?(gear)
+         puts("...-")
       else
          unless is_built_remotely?(gear) && gear.error_type == :ok
             gear.make(force: gear.error_type == :lost_deps)
@@ -530,13 +543,19 @@ class Gear
 
    def states
       @states ||=
-         %i(to_delete cloned checked_out built).select do |state|
+         %i(to_delete cloned checked_out built removed).select do |state|
             send("is_#{state}?")
          end
    end
 
    def is_cloned?
-      File.directory?(File.join(plant.poligon_dir, name))
+      Dir.chdir(File.join(plant.poligon_dir, name)) do
+         IO.read(File.join('.git', IO.read('.git/HEAD')))
+      end
+
+      true
+   rescue Errno::ENOENT
+      false
    end
 
    def is_checked_out?
@@ -555,9 +574,14 @@ class Gear
            @storen_status['tag_name'] == tag_name )
    end
 
+   # detects weither gear is marked to delete
    def is_to_delete?
       fetched_at.nil?
-      #!plant.in_branch_match_package?(name)
+   end
+
+   # detects weither gear is absent in target branch
+   def is_removed?
+      !(no || plant.in_branch_match_package?(name))
    end
 
    def logfile
@@ -637,9 +661,16 @@ class Gear
 
    def clone
       print "...cloning"
-      sh('git', 'clone', fullpath, name, logfile: logfile, logmode: 'a+')
+      res = sh('git', 'clone', fullpath, name, logfile: logfile, logmode: 'a+')
 
-      state = error_type == :not_exist && :to_delete || :cloned
+      state =
+         if error_type == :not_exist
+            :to_delete
+         elsif error_type == :unbuilt && res.grep(/unable to checkout/).any?
+            :removed
+         else
+            :cloned
+         end
 
       @states |= [state]
    end
@@ -656,7 +687,6 @@ class Gear
    def build
       print "...building"
       while %i(unbuilt lost_indeces).include?(error_type)
-#         binding.pry
          preclean
          sh('gear-hsh', '--commit', '--', '-vvvv', logfile: logfile)
          @states |= [:built] if (@status = $?.exitstatus) == 0
