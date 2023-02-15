@@ -1,5 +1,6 @@
 #!/usr/bin/ruby
 require 'fileutils'
+require 'erb'
 require 'pry'
 require 'yaml'
 require 'net/http'
@@ -9,6 +10,36 @@ require 'optparse'
 require 'ostruct'
 
 # req ruby >= 2.5
+#
+HASHER_CONFIG =<<END
+# -*- sh -*-
+USER="`echo $USER`"
+workdir=<%= hasher_root %>
+target=<%= arch %>
+packager="`rpm --eval %packager`"
+apt_config="<%= config_dir %>/apt.conf"
+allowed_mountpoints=/proc,/dev/pts,/dev/fd
+known_mountpoints=/proc,/dev/pts,/dev/fd
+lazy_cleanup=1
+share_network=1
+nproc=1
+pkg_build_list="${pkg_build_list},vim-common,pry,file"
+END
+
+APT_CONFIG =<<END
+Dir::Etc::SourceList <%= config_dir %>/apt.list;
+END
+
+APT_LIST =<<END
+rpm file:///ALT/<%= to_branch %>/ <%= arch %> classic
+<% if arch == 'x86_64' -%>
+# rpm file:///ALT/<%= to_branch %>/ x86_64-i586 classic
+<% end -%>
+rpm file:///ALT/<%= to_branch %>/ noarch classic
+<% if task_no -%>
+# rpm http://git.altlinux.org/repo/<%= task_no %>/ <%= arch %> task
+<% end -%>
+END
 
 DEFAULT_OPTIONS = {
    plant_dir: File.join(Dir.home, 'plant'),
@@ -20,11 +51,12 @@ DEFAULT_OPTIONS = {
    auto_assign: false,
    assign: false,
    list_file: File.join(Dir.home, "list1"),
-   to_branch: 'sisyphus',
+   to_branch: nil,
    in_branch: 'sisyphus',
    host: "git.altlinux.org",
-   hasher_root: '/tmp/.private/' + ENV['USER'],
-   repo_base_path: '/ALT'
+   hasher_root: nil,
+   repo_base_path: '/ALT',
+   arch: nil,
 }
 
 def option_parser
@@ -111,11 +143,13 @@ module Shell
       log =
          begin
             `#{args.join(' ')} 2>&1`.split("\n")
-         rescue
+         rescue => e
+            error(:install, 'Long arg list to install')
+
             []
          end
    ensure
-      #binding.pry #if logfile.to_s =~ /install/
+     # binding.pry if logfile.to_s =~ /install/
      File.open(logfile, logmode) { |f| f.puts(log.join("\n")) } if logfile && !log.nil? && !log.empty?
    end
 end
@@ -131,6 +165,10 @@ class Plant
 
    def root
       @root ||= options.plant_dir
+   end
+
+   def hasher_root
+      @hasher_root ||= options.hasher_root || options.plant_dir
    end
 
    def poligon_dir
@@ -182,12 +220,27 @@ class Plant
       @status_dir
    end
 
+   def task_data
+      return @task_data if @task_data
+
+      if task_no
+         json = Net::HTTP.get(plant.host, "/tasks/#{task_no}/info.json")
+         @task_data = JSON.parse(json)
+      end
+
+      @task_data
+   end
+
+   def to_branch
+      @to_branch ||= options.to_branch || task_no && task_data['repo'] || options.in_branch
+   end
+
    def git_host
       @git_host ||= "git://#{options.host}/"
    end
 
    def cleanup
-      sh('hsh', '--initroot', '-vvvv', logfile: File.join(log_dir, 'initroot.log'))
+      sh('hsh', '--initroot', '-vvvv', *hasher_args, logfile: File.join(log_dir, 'initroot.log'))
       %w(hasher_dirs log_dir srpm_dir rpm_dir status_dir).flatten.each do |x|
          FileUtils.rm_rf(send(x))
          instance_variable_set("@#{x}", nil)
@@ -216,8 +269,86 @@ class Plant
       in_branch_srpm_list_plain =~ /^#{name}-[^-]*-alt[^-]*$/
    end
 
+   def arch
+      @arch ||= options.arch || RbConfig::CONFIG['host_cpu']
+   end
+
+   def hasher_config
+      @hasher_config ||= File.open(File.join(config_dir, "hasher.conf"), "w+") do |f|
+         c = ERB.new(HASHER_CONFIG, trim_mode: "<>-").result(binding)
+
+         f.puts(c)
+
+         c
+      end
+   end
+
+   def apt_config
+      @apt_config ||= File.open(File.join(config_dir, "apt.conf"), "w+") do |f|
+         c = ERB.new(APT_CONFIG, trim_mode: "<>-").result(binding)
+
+         f.puts(c)
+
+         c
+      end
+   end
+
+   def apt_list
+      @apt_list ||= File.open(File.join(config_dir, "apt.list"), "w+") do |f|
+         c = ERB.new(APT_LIST, trim_mode: "<>-").result(binding)
+
+         f.puts(c)
+
+         c
+      end
+   end
+
+   def config_dir
+      return @config_dir if @config_dir && File.directory?(@config_dir)
+
+      @config_dir = File.join(root, "config")
+      FileUtils.mkdir_p(@config_dir)
+
+      @config_dir
+   end
+
+   def packager
+      @packager ||= `rpm --eval %packager`.strip
+   end
+
+   def hasher_args
+      if is_hasher_supports_config?
+         hasher_args_config
+      else
+         hasher_args_expanded
+      end
+   end
+
+   def hasher_args_config
+      [
+         "--config=#{File.join(config_dir, 'hasher.conf')}",
+      ]
+   end
+
+   def hasher_args_expanded
+      ["--apt-config=#{File.join(config_dir, 'apt.conf')}",
+       "--workdir=#{hasher_root}",
+       '--lazy-cleanup',
+       "--target=#{arch}",
+       "--packager=#{packager}",
+       '--mountpoints=/proc,/dev/pts,/dev/fd',
+       '--nprocs=1'
+      ]
+   end
+
+   def is_hasher_supports_config?
+      @is_hasher_supports_config ||= sh('hsh', '--help', logfile: nil).grep(/--config/).any?
+   end
+
    def initialize options
       @options = OpenStruct.new(options)
+
+      apt_config && apt_list && hasher_config
    end
 
    def method_missing method, *args
@@ -371,17 +502,8 @@ class Build
       $stdout.puts(l) if plant.verbose
    end
 
-   def task_data
-      return @task_data if @task_data
-
-      if task_no
-         json = Net::HTTP.get(plant.host, "/tasks/#{task_no}/info.json")
-         @task_data = JSON.parse(json)
-      end
-   end
-
    def targets
-      task_data && task_data["subtasks"] || []
+      plant.task_data && plant.task_data["subtasks"] || []
    end
 
    def list_hash
@@ -456,7 +578,7 @@ class Build
    def install
       if !plant.break_on_error || gears.empty? || @errors == 0
          rpms = gears.values.map {|v| v.rpms }.flatten.reject {|x| x =~ /debuginfo/ }
-         sh('hsh-install', rpms.join(" "), logfile: File.join(plant.log_dir, 'install.log'))
+         sh('hsh-install', *plant.hasher_args, rpms.join(" "), logfile: File.join(plant.log_dir, 'install.log'))
       end
    end
 
@@ -688,7 +810,7 @@ class Gear
       print "...building"
       while %i(unbuilt lost_indeces).include?(error_type)
          preclean
-         sh('gear-hsh', '--commit', '--', '-vvvv', logfile: logfile)
+         sh('gear-hsh', '--commit', '--', *plant.hasher_args, '-vvvv', logfile: logfile)
          @states |= [:built] if (@status = $?.exitstatus) == 0
       end
    end
@@ -696,7 +818,7 @@ class Gear
    # переименован 'chroot/.out/gem-method-source-1.0.0-alt1.src.rpm' -> 'repo/SRPMS.hasher/gem-method-source-1.0.0-alt1.src.rpm'
    def files
       @files ||=
-         if has_log?
+         if has_log? && has_status?
             log.split("\n").grep(/chroot\/.out.* -> /).map do |x|
                /'(?<apath>[^']+)'$/ =~ x
                apath
@@ -719,15 +841,19 @@ class Gear
    end
 
    def rpms
-      @rpms ||= files.grep(/\/RPMS/).each do |file|
+      @rpms ||= files.grep(/\/RPMS/).map do |file|
          filename = File.basename(file)
          if !File.symlink?(file)
             newfile = File.join(plant.rpm_dir, filename)
 
             FileUtils.mv(file, plant.rpm_dir) if File.file?(file)
             FileUtils.ln_s(newfile, file) if File.file?(newfile)
+
+            file
+         elsif File.symlink?(file) && File.exist?(file)
+            file
          end
-      end
+      end.compact
    end
 
    def branches
@@ -771,6 +897,10 @@ class Gear
 
    def has_log?
       File.file?(logfile)
+   end
+
+   def has_status?
+      File.file?(status_file)
    end
 
    def is_originally_built?
