@@ -54,7 +54,7 @@ DEFAULT_OPTIONS = {
    to_branch: nil,
    in_branch: 'sisyphus',
    host: "git.altlinux.org",
-   hasher_root: nil,
+   hasher_root: ENV['TMP'],
    repo_base_path: '/ALT',
    arch: nil,
 }
@@ -146,11 +146,23 @@ module Shell
          rescue => e
             error(:install, 'Long arg list to install')
 
-            []
+            raise(e)
          end
    ensure
      # binding.pry if logfile.to_s =~ /install/
      File.open(logfile, logmode) { |f| f.puts(log.join("\n")) } if logfile && !log.nil? && !log.empty?
+   end
+end
+
+module Erb
+   if RUBY_VERSION < '2.7.0'
+      def self.eval text
+         ERB.new(text, nil, "<>-")
+      end
+   else
+      def self.eval text
+         ERB.new(text, trim_mode: "<>-")
+      end
    end
 end
 
@@ -274,8 +286,33 @@ class Plant
    end
 
    def hasher_config
-      @hasher_config ||= File.open(File.join(config_dir, "hasher.conf"), "w+") do |f|
-         c = ERB.new(HASHER_CONFIG, trim_mode: "<>-").result(binding)
+      return @hasher_config if @hasher_config
+
+      filename =
+         if is_hasher_supports_config?
+            File.join(config_dir, "hasher.conf")
+         else
+            default_filename = '~/.hasher/config'
+
+            if File.file?(default_filename)
+               re = %r{#{default_filename.gsub('$', '\$')}.orig(?:\.(?<index>\d+))?}
+               index = Dir["#{default_filename}.orig*"].reduce(nil) do |i, f|
+                  next i unless m = re.match(f)
+                  new_index = m[:index].to_i
+
+                  i.to_i > new_index ? i : new_index
+               end
+
+               FileUtils.mv(default_filename, [default_filename, 'orig', index].compact.join('.'))
+            else
+               FileUtils.mkdir_p('~/.hasher')
+            end
+
+            default_filename
+         end
+
+      @hasher_config = File.open(filename, "w+") do |f|
+         c = Erb.eval(HASHER_CONFIG).result(binding)
 
          f.puts(c)
 
@@ -285,7 +322,7 @@ class Plant
 
    def apt_config
       @apt_config ||= File.open(File.join(config_dir, "apt.conf"), "w+") do |f|
-         c = ERB.new(APT_CONFIG, trim_mode: "<>-").result(binding)
+         c = Erb.eval(APT_CONFIG).result(binding)
 
          f.puts(c)
 
@@ -295,7 +332,7 @@ class Plant
 
    def apt_list
       @apt_list ||= File.open(File.join(config_dir, "apt.list"), "w+") do |f|
-         c = ERB.new(APT_LIST, trim_mode: "<>-").result(binding)
+         c = Erb.eval(APT_LIST).result(binding)
 
          f.puts(c)
 
@@ -320,7 +357,7 @@ class Plant
       if is_hasher_supports_config?
          hasher_args_config
       else
-         hasher_args_expanded
+         hasher_args_default
       end
    end
 
@@ -330,15 +367,8 @@ class Plant
       ]
    end
 
-   def hasher_args_expanded
-      ["--apt-config=#{File.join(config_dir, 'apt.conf')}",
-       "--workdir=#{hasher_root}",
-       '--lazy-cleanup',
-       "--target=#{arch}",
-       "--packager=#{packager}",
-       '--mountpoints=/proc,/dev/pts,/dev/fd',
-       '--nprocs=1'
-      ]
+   def hasher_args_default
+      []
    end
 
    def is_hasher_supports_config?
@@ -568,18 +598,20 @@ class Build
 
       File.open(File.join(plant.root, "common.yml"), "w+") {|f| f.puts(statuses.to_yaml) }
       oks = gears.values.sum  {|x| is_matched?(x) && 1 || 0 }
-      @errors = gears.values.size - oks
+      @error_count = gears.values.size - oks
 
-      puts "Compilation summary: ok: #{oks}, errored #{errors}"
+      puts "Compilation summary: ok: #{oks}, errored #{@error_count}"
 
       install
    end
 
    def install
-      if !plant.break_on_error || gears.empty? || @errors == 0
+      if !plant.break_on_error || gears.empty? || @error_count == 0
          rpms = gears.values.map {|v| v.rpms }.flatten.reject {|x| x =~ /debuginfo/ }
          sh('hsh-install', *plant.hasher_args, rpms.join(" "), logfile: File.join(plant.log_dir, 'install.log'))
       end
+   rescue Errno::E2BIG
+      sh('hsh-install', *plant.hasher_args, File.join(plant.hasher_root, "repo", plant.arch, "RPMS.hasher/*.rpm"), logfile: File.join(plant.log_dir, 'install.log'))
    end
 
    def statuses
