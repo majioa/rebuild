@@ -611,7 +611,7 @@ class Build
          sh('hsh-install', *plant.hasher_args, rpms.join(" "), logfile: File.join(plant.log_dir, 'install.log'))
       end
    rescue Errno::E2BIG
-      sh('hsh-install', *plant.hasher_args, File.join(plant.hasher_root, "repo", plant.arch, "RPMS.hasher/*.rpm"), logfile: File.join(plant.log_dir, 'install.log'))
+      sh('hsh-install', *plant.hasher_args, File.join(plant.hasher_root, 'repo', plant.arch, 'RPMS.hasher', '*.rpm'), logfile: File.join(plant.log_dir, 'install.log'))
    end
 
    def statuses
