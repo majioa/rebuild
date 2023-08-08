@@ -292,7 +292,7 @@ class Plant
          if is_hasher_supports_config?
             File.join(config_dir, "hasher.conf")
          else
-            default_filename = '~/.hasher/config'
+            default_filename = "#{ENV['HOME']}/.hasher/config"
 
             if File.file?(default_filename)
                re = %r{#{default_filename.gsub('$', '\$')}.orig(?:\.(?<index>\d+))?}
