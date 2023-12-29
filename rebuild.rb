@@ -23,7 +23,7 @@ known_mountpoints=/proc,/dev/pts,/dev/fd
 lazy_cleanup=1
 share_network=1
 nproc=1
-pkg_build_list="${pkg_build_list},vim-common,pry,file"
+pkg_build_list="${pkg_build_list},file"
 END
 
 APT_CONFIG =<<END
