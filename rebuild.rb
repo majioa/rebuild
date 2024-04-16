@@ -132,8 +132,11 @@ pp options
 
 module Shell
    def sh *args, mode: 'r+', logfile: nil, logmode: 'w+'
+      log = []
       $stdout.puts(args.join(' ')) if plant.verbose
-      log = IO.popen({'REBUILD' => '1'}, args.map(&:to_s), mode, err: %i(child out)) do |pipe|
+      log << args.join(' ') if plant.verbose
+
+      log.concat(IO.popen({'REBUILD' => '1'}, args.map(&:to_s), mode, err: %i(child out)) do |pipe|
          pipe.close_write
 
          log = []
@@ -143,19 +146,18 @@ module Shell
          end
 
          log
-      end
+      end)
    rescue Errno::E2BIG
-      log =
+      log.concat(
          begin
             `#{args.join(' ')} 2>&1`.split("\n")
          rescue => e
             error(:install, 'Long arg list to install')
 
             raise(e)
-         end
+         end)
    ensure
-     # binding.pry if logfile.to_s =~ /install/
-     File.open(logfile, logmode) { |f| f.puts(log.join("\n")) } if logfile && !log.nil? && !log.empty?
+      File.open(logfile, logmode) { |f| f.puts(log.join("\n")) } if logfile && !log.nil? && !log.empty?
    end
 end
 
@@ -712,6 +714,10 @@ class Gear
       !(no || plant.in_branch_match_package?(name))
    end
 
+   def branch
+      plant.to_branch || plant.in_branch
+   end
+
    def logfile
       @logfile = File.join(plant.log_dir, "#{name}.log")
    end
@@ -794,7 +800,7 @@ class Gear
       state =
          if error_type == :not_exist
             :to_delete
-         elsif error_type == :unbuilt && res.grep(/unable to checkout/).any?
+         elsif error_type == :unbuilt && !branches.include?(branch)
             :removed
          else
             :cloned
@@ -868,7 +874,13 @@ class Gear
 
    def branches
       @branches ||=
-        sh('cat', '.git/packed-refs').select {|x| x =~ %r{remotes/origin} }.map {|x|x.match(%r{/(?<b>[^/]+)$})[:b]}
+         Dir.chdir(File.join(plant.poligon_dir, name)) do
+            sh('cat', '.git/packed-refs')
+         end.select do |x|
+            x =~ %r{remotes/origin}
+         end.map do |x|
+            x.match(%r{/(?<b>[^/]+)$})[:b]
+         end
    end
 
    def selected_tag
