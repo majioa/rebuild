@@ -44,13 +44,14 @@ END
 DEFAULT_OPTIONS = {
    plant_dir: File.join(Dir.home, 'plant'),
    task_no: nil,
+   in_task_noes: [],
    clean_plant: false,
    break_on_error: false,
    drop_nonbuilt: false,
    verbose: false,
    auto_assign: false,
    assign: false,
-   list_file: File.join(Dir.home, "list1"),
+   list_file: nil, #File.join(Dir.home, "list1"),
    to_branch: nil,
    in_branch: 'sisyphus',
    host: "git.altlinux.org",
@@ -68,8 +69,12 @@ def option_parser
             options[:plant_dir] = folder
          end
 
-         opts.on("-t", "--task-no=NUMBER", Integer, "Task number to prebuild the sources") do |no|
+         opts.on("-t", "--target-task-no=NUMBER", Integer, "Task number to prebuild the sources") do |no|
             options[:task_no] = no
+         end
+
+         opts.on("-s", "--source-task-numbers=NUMBERS", String, "Comma separated task number list to copy the sources from") do |noes|
+            options[:in_task_noes] = noes.split(",").map(&:to_i).sort
          end
 
          opts.on("-l", "--list-file=FILE", String, "List file to rebuild") do |file|
@@ -169,7 +174,11 @@ end
 class Plant
    include Shell
 
-   attr_reader :options
+   attr_reader :options, :to_task, :in_tasks
+
+   def list_file
+      options.list_file
+   end
 
    def plant
       self
@@ -232,19 +241,12 @@ class Plant
       @status_dir
    end
 
-   def task_data
-      return @task_data if @task_data
-
-      if task_no
-         json = Net::HTTP.get(plant.host, "/tasks/#{task_no}/info.json")
-         @task_data = JSON.parse(json)
-      end
-
-      @task_data
+   def in_branch
+      @in_branch ||= in_tasks && in_tasks.reduce(nil) { |res, t| res || t.no && t.data['repo'] } || options.in_branch
    end
 
    def to_branch
-      @to_branch ||= options.to_branch || task_no && task_data['repo'] || options.in_branch
+      @to_branch ||= options.to_branch || to_task&.no && to_task.data['repo'] || in_branch
    end
 
    def git_host
@@ -377,6 +379,8 @@ class Plant
 
    def initialize options
       @options = OpenStruct.new(options)
+      @to_task = Task.new(@options.task_no, @options.host, git_host, plant) if @options.task_no
+      @in_tasks = @options.in_task_noes.map { |no| Task.new(no, @options.host, git_host, plant) } unless @options.in_task_noes.any?
 
       apt_config && apt_list && hasher_config
    end
@@ -398,11 +402,15 @@ class Build
    end
 
    def is_require_assiging? gear, flow
-     task_no && plant.options.auto_assign && !flow.map { |x| x['name']}.include?(gear.name) && is_matched?(gear)
+     task && plant.options.assign && !task.include?(gear) && is_matched?(gear)
+   end
+
+   def is_require_autoassiging? gear, flow
+     task && plant.options.auto_assign && !flow.map { |x| x['name']}.include?(gear.name) && is_matched?(gear)
    end
 
    def is_require_reassiging? gear, flow
-     task_no && plant.options.auto_assign && flow.map { |x| x['name']}.include?(gear.name) && gear.lost_deps&.any?
+     task && plant.options.auto_assign && flow.map { |x| x['name']}.include?(gear.name) && gear.lost_deps&.any?
    end
 
    def is_matched? gear
@@ -436,17 +444,17 @@ class Build
    end
 
    def check_assign_to_task gear, name, flow
-      res = true
+      req_no = task.detect_subtask_self_or_before(gear)
 
-      if req_no = detect_subtask_self_or_before(gear.no, flow)
-         res = yield if block_given?
+      if block_given? ? yield : true
+         assigned = assign_to_task(task_no, name, subtask_no: req_no)
 
-         aa=assign_to_task(task_no, name, subtask_no: req_no) if res
-#         binding.pry
-         aa
-      else
-         error(:assign, 'No free space before #{gear.name} with no #{gear.no}', gear)
+         task.encache(gear, assigned["no"]) if assigned["no"]
+
+         assigned
       end
+   rescue Task::NoSpaceAvailableError
+      error(:assign, 'No free space before #{gear.name} with no #{gear.no}', gear)
    end
 
    def autoassign gear, flow
@@ -458,6 +466,7 @@ class Build
          end
 
          remove_in_task(task_no, gear.name)
+         #binding.pry
          flow.shift
       elsif gear.states.include?(:built)
          check_assign_to_task(gear, gear.name, flow)
@@ -498,19 +507,6 @@ class Build
       end
    end
 
-   def detect_subtask_self_or_before no_in, flow
-      if no_in > 1
-         noes_tmp = (noes | flow.map { |x| x['no']}.compact).sort
-         no = no_in
-
-         while no > 1 && noes_tmp.find {|x| no - 1 == x }
-            no -= 1
-         end
-
-         no > 1 && no || nil
-      end
-   end
-
    def remove_in_task task_no, name
       sh('ssh', 'git_majioa@gyle.altlinux.org', '-p', '222', 'task', 'add', task_no, 'del', name)
    end
@@ -518,27 +514,29 @@ class Build
    def assign_to_task task_no, name, subtask_no: nil
       args = ['ssh', 'git_majioa@gyle.altlinux.org', '-p', '222', 'task', 'add', task_no, subtask_no&.to_s(8), func, name]
 
-      l = sh(*args.compact)
-      /added #(?<subtask_no8>\d+): build tag "(?<tag>[^"]+)"/ =~ l.last
+      message = sh(*args.compact)
+      /added #(?<subtask_no8>\d+): build tag "(?<tag>[^"]+)"/ =~ message.last
 
+      # binding.pry
       {
          'name' => name,
-         'path' => File.join(plant.git_host, "tasks", task_no.to_s, "gears", subtask_no8, "git"),
+         'path' => subtask_no8 ? File.join(plant.git_host, "tasks", task_no.to_s, "gears", subtask_no8, "git") : nil,
          'tag_name' => tag,
-         'no' => subtask_no8.to_i(8),
-         'fetched_at' => Time.now
+         'no' => subtask_no8&.to_i(8),
+         'fetched_at' => Time.now,
+         'message' => message.join("\n")
       }
    rescue
       $stdout.puts(l) if plant.verbose
    end
 
-   def targets
-      plant.task_data && plant.task_data["subtasks"] || []
+   def package_hash
+      plant.in_tasks.reduce(plant.to_task&.package_hash) { |h, t| h.merge(t.package_hash) }
    end
 
    def list_hash
       @list_hash ||=
-         package_hash.merge((IO.read(plant.list_file).split("\n") - package_hash.keys).map do |name_in|
+         package_hash.merge((plant.list_file && (IO.read(plant.list_file).split("\n") - package_hash.keys) || {}).map do |name_in|
             /^(?<name_tmp>.*)-[^-]*-alt[^-]*$/ =~ name_in
             name = name_tmp || name_in
             value = (package_hash[name] || {}).merge({
@@ -549,43 +547,12 @@ class Build
 
             [name, value]
          end.to_h)
+      #binding.pry
+      #@list_hash
    end
 
    def no_hash
       @no_hash ||= package_hash.map {|(_name, data)| [data['no'], data] }.to_h
-   end
-
-   def package_hash
-      @package_hash ||=
-         targets.map do |(no, d)|
-           #binding.pry if d["type"] == 'delete'
-            #next nil if !d["dir"] || d["type"] == 'delete'
-            name =
-               if d["type"] == 'delete'
-                  d['package']
-               elsif d["dir"]
-                  d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
-               end
-
-            next nil unless name
-
-            data = {
-               'name' => name,
-               'path' => File.join(plant.git_host, "tasks", task_no.to_s, "gears", no.to_s, "git"),
-               'tag_name' => d['tag_name'],
-               'tag_id' => d['tag_id'],
-               'no' => no.to_i(8),
-               'pkgname' => d["pkgname"] || d['package'],
-               'rebuild_from' => d["rebuild_from"],
-               'fetched_at' => d["fetched"] && Time.parse(d["fetched"])
-            }
-
-            [ name, data ]
-         end.compact.to_h
-   end
-
-   def noes
-      @noes ||= targets.keys.map {|x|x.to_i(8) }.sort
    end
 
    def delete_subtask no
@@ -665,7 +632,10 @@ class Build
 
    def gear_post_proceed gear, flow
       gear.store_status
+
       if is_require_assiging?(gear, flow)
+         autoassign(gear, flow)
+      elsif is_require_autoassiging?(gear, flow)
          autoassign(gear, flow)
       elsif is_require_reassiging?(gear, flow)
          autoreassign(gear, flow)
@@ -675,7 +645,11 @@ class Build
    end
 
    def task_no
-      @task_no = plant.options.task_no
+      @task_no ||= plant.options.task_no
+   end
+
+   def task
+      @task ||= plant.to_task
    end
 
    def initialize plant
@@ -847,6 +821,10 @@ class Gear
       end
    end
 
+   def renumber_with no
+      @no = no
+   end
+
    # переименован 'chroot/.out/gem-method-source-1.0.0-alt1.src.rpm' -> 'repo/SRPMS.hasher/gem-method-source-1.0.0-alt1.src.rpm'
    def files
       @files ||=
@@ -970,6 +948,145 @@ class Gear
          status = load_status(name, plant)
 
          self.new(status, name: name, plant: plant, **args)
+      end
+   end
+end
+
+class Task
+   class NoSpaceAvailableError < StandardError; end
+   class GearNotFoundError < StandardError; end
+
+   attr_reader :host, :git_host, :no, :plant
+
+   def data 
+      return @data if @data
+
+      @data = JSON.parse(Task.load(host, no)) || {} if no
+   rescue JSON::ParserError, TypeError
+      {}
+   end
+
+   def cache
+      @cache ||= {}
+   end
+
+   def targets
+      data["subtasks"] || []
+   end
+
+   def include? gear
+      #package_hash[gear.name] || cache.values.find { |g| g.name == gear.name }
+      true if find!(gear)
+   rescue GearNotFoundError
+      false
+   end
+
+   def encache gear_in, no
+      gear = gear_in.dup
+      gear.renumber_with(no)
+
+      @cache[no] = gear
+   end
+
+   def gears
+      static.merge(cache)
+   end
+
+   def static
+      @static ||=
+         package_hash.map do |(_, hash)|
+            [hash["no"], Gear.import(**hash.transform_keys(&:to_sym), plant: plant)]
+         end.to_h
+   end
+
+   def find! gear
+      gears.values.find { |g| g.name == gear.name && gear.no } || raise(GearNotFoundError)
+   end
+
+   def detect_subtask_self_or_before gear
+      no_in = find!(gear).no
+
+         #noes_tmp = (task.noes | flow.map { |x| x['no']}.compact).sort
+      noes_tmp = noes
+      no = no_in
+
+      while no > 1 && noes_tmp.find {|x| no - 1 == x }
+         no -= 1
+      end
+
+         binding.pry
+      raise NoSpaceAvailableError if no <= 1
+
+      no
+   rescue GearNotFoundError
+      nil
+   end
+
+   def package_hash
+      @package_hash ||=
+         targets.map do |(target_no, d)|
+           #binding.pry if d["type"] == 'delete'
+            #next nil if !d["dir"] || d["type"] == 'delete'
+            name =
+               if d["type"] == 'delete'
+                  d['package']
+               elsif d["dir"]
+                  d["dir"].match(/(?<name>[^\/]+).git$/)[:name]
+               end
+
+            next nil unless name
+
+            data = {
+               'name' => name,
+               'path' => url_for(target_no),
+               'tag_name' => d['tag_name'],
+               'tag_id' => d['tag_id'],
+               'no' => target_no.to_i(8),
+               'pkgname' => d["pkgname"] || d['package'],
+               'rebuild_from' => d["rebuild_from"],
+               'fetched_at' => d["fetched"] && Time.parse(d["fetched"])
+            }
+
+            [ name, data ]
+         end.compact.to_h
+   end
+
+   def archived?
+      data["state"] == "DONE"
+   end
+
+   def url_for target_no
+      parts = [git_host, "tasks"]
+      parts << "archive" << "done" << "_#{Task.group_for(no)}" if archived?
+      parts << no.to_s << "gears" << target_no.to_s << "git"
+
+      File.join(*parts)
+   end
+
+   def noes
+      (package_hash.keys.map {|x|x.to_i(8) } | cache.keys).sort
+   end
+
+   def initialize no, host, git_host, plant
+      @no = no
+      @host = host
+      @git_host = git_host
+      @plant = plant
+   end
+
+   class << self
+      def group_for no
+         (no.to_i / 10000) * 10
+      end
+
+      def load host, no
+         json = Net::HTTP.get(host, "/tasks/#{no}/info.json")
+
+         if json.empty?
+            Net::HTTP.get(host, "/tasks/archive/done/_#{group_for(no)}/#{no}/info.json")
+         else
+            json
+         end
       end
    end
 end
