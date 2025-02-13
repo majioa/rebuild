@@ -141,7 +141,11 @@ module Shell
 
          log = []
          while line = pipe.gets
-            log.append(line.strip)
+            begin
+               log.append(line.strip)
+            rescue Encoding::CompatibilityError
+               log.append(line)
+            end
             $stdout.puts line if plant.verbose
          end
 
@@ -244,7 +248,7 @@ class Plant
    end
 
    def in_branch
-      @in_branch ||= in_tasks && in_tasks.reduce(nil) { |res, t| res || t.no && t.data['repo'] } || options.in_branch
+      @in_branch ||= in_tasks.any? && in_tasks.reduce(nil) { |res, t| res || t.no && t.data['repo'] } || options.in_branch
    end
 
    def to_branch
@@ -382,7 +386,7 @@ class Plant
    def initialize options
       @options = OpenStruct.new(options)
       @to_task = Task.new(@options.task_no, @options.host, git_host, plant) if @options.task_no
-      @in_tasks = @options.in_task_noes.map { |no| Task.new(no, @options.host, git_host, plant) } unless @options.in_task_noes.any?
+      @in_tasks = @options.in_task_noes.map { |no| Task.new(no, @options.host, git_host, plant) }
 
       apt_config && apt_list && hasher_config
    end
@@ -800,7 +804,7 @@ class Gear
       state =
          if error_type == :not_exist
             :to_delete
-         elsif error_type == :unbuilt && !branches.include?(branch)
+         elsif error_type == :unbuilt && res.grep(/unable to checkout/).any? && !branches.include?(branch)
             :removed
          else
             :cloned
