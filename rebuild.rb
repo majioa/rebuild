@@ -146,6 +146,9 @@ module Shell
          while line = pipe.gets
             begin
                log.append(line.strip)
+            rescue ArgumentError
+               line = line.unpack("C*").pack("U*")
+               retry
             rescue Encoding::CompatibilityError
                log.append(line)
             end
