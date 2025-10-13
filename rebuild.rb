@@ -1,7 +1,10 @@
 #!/usr/bin/ruby
+begin
+require 'pry'
+rescue LoadError
+end
 require 'fileutils'
 require 'erb'
-require 'pry'
 require 'yaml'
 require 'net/http'
 require 'json'
@@ -256,7 +259,11 @@ class Plant
    end
 
    def git_host
-      @git_host ||= "git://#{options.host}/"
+      @git_host ||= "https://#{options.host}/"
+   end
+
+   def gitery_host
+      @gitery_host ||= "git://#{options.host}/"
    end
 
    def cleanup
@@ -385,8 +392,8 @@ class Plant
 
    def initialize options
       @options = OpenStruct.new(options)
-      @to_task = Task.new(@options.task_no, @options.host, git_host, plant) if @options.task_no
-      @in_tasks = @options.in_task_noes.map { |no| Task.new(no, @options.host, git_host, plant) }
+      @to_task = Task.new(@options.task_no, @options.host, gitery_host, plant) if @options.task_no
+      @in_tasks = @options.in_task_noes.map { |no| Task.new(no, @options.host, gitery_host, plant) }
 
       apt_config && apt_list && hasher_config
    end
@@ -526,7 +533,7 @@ class Build
       # binding.pry
       {
          'name' => name,
-         'path' => subtask_no8 ? File.join(plant.git_host, "tasks", task_no.to_s, "gears", subtask_no8, "git") : nil,
+         'paths' => [subtask_no8 ? File.join(plant.gitery_host, "tasks", task_no.to_s, "gears", subtask_no8, "git") : nil].compact,
          'tag_name' => tag,
          'no' => subtask_no8&.to_i(8),
          'fetched_at' => Time.now,
@@ -546,7 +553,7 @@ class Build
             /^(?<name_tmp>.*)-[^-]*-alt[^-]*$/ =~ name_in
             name = name_tmp || name_in
             value = (package_hash[name] || {}).merge({
-               'path' => "/gears/#{name[0]}/#{name}.git",
+               'paths' => ["/gears/#{name[0]}/#{name}.git", "/srpms/#{name[0]}/#{name}.git"],
                'name' => name,
                'fetched_at' => Time.now
             })
@@ -580,8 +587,9 @@ class Build
 
    def install
       if !plant.break_on_error || gears.empty? || @error_count == 0
-         rpms = gears.values.map {|v| v.rpms }.flatten.reject {|x| x =~ /debuginfo/ }
-         sh('hsh-install', *plant.hasher_args, rpms.join(" "), logfile: File.join(plant.log_dir, 'install.log'))
+         rpms = gears.values.map {|v| v.rpm_names }.flatten.reject {|x| x =~ /debuginfo/ }
+         puts "hsh-install #{rpms.join(" ")}"
+         sh('hsh-install', *plant.hasher_args, *rpms, logfile: File.join(plant.log_dir, 'install.log'))
       end
    rescue Errno::E2BIG
       sh('hsh-install', *plant.hasher_args, File.join(plant.hasher_root, 'repo', plant.arch, 'RPMS.hasher', '*.rpm'), logfile: File.join(plant.log_dir, 'install.log'))
@@ -666,10 +674,10 @@ end
 class Gear
    include Shell
 
-   NAMES = %w(srpms rpms name path tag_name tag_id fetched_at states)
+   NAMES = %w(srpms rpms name paths tag_name tag_id fetched_at states)
    RE = /E: (Невозможно найти пакет (?:ruby-?)?gem\((?<name>[^ )]+)\)(?<cond>[>=<~!]+)(?<version>[^']*)|Версия (?<cond>[>=<~!]+)'(?<version>[^']*)' для '(?:ruby-?)?gem\((?<name>[^ ']+)\)' не найдена)|: Требует: gem\((?<name>[^ )]+)\) \((?<cond>[>=<~!]+)(?<version>[^']*)\)/
 
-   attr_reader :plant, :states, :status, :name, :path, :srpms, :rpms, :tag_name, :tag_id, :fetched_at, :pkgname, :no, :rebuild_from
+   attr_reader :plant, :states, :status, :name, :paths, :srpms, :rpms, :tag_name, :tag_id, :fetched_at, :pkgname, :no, :rebuild_from
 
    def status
       @status ||= srpms.any? && 0 || nil
@@ -726,8 +734,8 @@ class Gear
       @logfile = File.join(plant.log_dir, "#{name}.log")
    end
 
-   def fullpath
-      @fullpath ||= path =~ /^git:\/\// && path || File.join(plant.git_host, path)
+   def fullpaths
+      @fullpaths ||= paths.map { |path| path =~ /^(?:https|git):\/\// ? path : File.join(plant.git_host, path) }
    end
 
    def preclean
@@ -750,7 +758,8 @@ class Gear
          case log
          when /E: Some index files failed to download. /
             :lost_indeces
-         when /fatal: remote error: access denied or repository not exported/
+         when /fatal: remote error: access denied or repository not exported/,
+              /fatal: repository '.*' not found/
             :not_exist
          when RE
             :lost_deps
@@ -799,15 +808,24 @@ class Gear
 
    def clone
       print "...cloning"
-      res = sh('git', 'clone', fullpath, name, logfile: logfile, logmode: 'a+')
 
       state =
-         if error_type == :not_exist
-            :to_delete
-         elsif error_type == :unbuilt && res.grep(/unable to checkout/).any? && !branches.include?(branch)
-            :removed
-         else
-            :cloned
+         fullpaths.reduce(nil) do |r, path|
+            next r if r
+
+            res = sh('git', 'clone', path, name, logfile: logfile, logmode: 'a+')
+
+            state_in =
+              if error_type(res.join) == :not_exist
+                  preclean
+                  :to_delete
+              elsif error_type(res.join) == :unbuilt && res.grep(/unable to checkout/).any? && !branches.include?(branch)
+                  :removed
+               else
+                  :cloned
+               end
+
+            state_in == :to_delete ? nil : state_in
          end
 
       @states |= [state]
@@ -874,6 +892,18 @@ class Gear
             file
          end
       end.compact
+   end
+
+   def rpm_names
+      @rpm_names ||=
+         rpms.map do |rpm|
+            # /tmp/.private/majioa/repo/x86_64/RPMS.hasher/gem-concurrent-ruby-edge-doc-0.7.2-alt1.noarch.rpm
+            if %r{.*/(?<name>[^/]+)-[^\-]+-[^\-]+\.[^\.]+\.rpm$} =~ rpm
+               name
+            else
+               raise
+            end
+         end.compact
    end
 
    def branches
@@ -972,7 +1002,7 @@ class Task
    class NoSpaceAvailableError < StandardError; end
    class GearNotFoundError < StandardError; end
 
-   attr_reader :host, :git_host, :no, :plant
+   attr_reader :host, :gitery_host, :no, :plant
 
    def data 
       return @data if @data
@@ -1030,7 +1060,6 @@ class Task
          no -= 1
       end
 
-         binding.pry
       raise NoSpaceAvailableError if no <= 1
 
       no
@@ -1054,7 +1083,7 @@ class Task
 
             data = {
                'name' => name,
-               'path' => url_for(target_no),
+               'paths' => [url_for(target_no)].compact,
                'tag_name' => d['tag_name'],
                'tag_id' => d['tag_id'],
                'no' => target_no.to_i(8),
@@ -1072,7 +1101,7 @@ class Task
    end
 
    def url_for target_no
-      parts = [git_host, "tasks"]
+      parts = [gitery_host, "tasks"]
       parts << "archive" << "done" << "_#{Task.group_for(no)}" if archived?
       parts << no.to_s << "gears" << target_no.to_s << "git"
 
@@ -1083,10 +1112,10 @@ class Task
       (package_hash.keys.map {|x|x.to_i(8) } | cache.keys).sort
    end
 
-   def initialize no, host, git_host, plant
+   def initialize no, host, gitery_host, plant
       @no = no
       @host = host
-      @git_host = git_host
+      @gitery_host = gitery_host
       @plant = plant
    end
 

@@ -1,0 +1,11 @@
+source 'https://rubygems.org'
+
+gem 'pry'
+gem 'fileutils'
+gem 'erb'
+gem 'yaml'
+gem 'net-http'
+gem 'json'
+gem 'time'
+gem 'optparse'
+gem 'ostruct'
