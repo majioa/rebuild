@@ -300,7 +300,7 @@ class Plant
    end
 
    def arch
-      @arch ||= options.arch || RbConfig::CONFIG['host_cpu']
+      @arch ||= options.arch || RbConfig::CONFIG['host_cpu'].gsub(/i.86/, 'i586')
    end
 
    def hasher_config
